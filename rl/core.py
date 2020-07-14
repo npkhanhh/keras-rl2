@@ -41,6 +41,7 @@ class Agent(object):
         self.processor = processor
         self.training = False
         self.step = 0
+        self.stop_training = False
 
     def get_config(self):
         """Configuration of the agent for serialization.
