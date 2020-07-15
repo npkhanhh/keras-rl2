@@ -3,6 +3,7 @@ from __future__ import print_function
 import warnings
 import timeit
 import json
+import csv
 from tempfile import mkdtemp
 
 import numpy as np
@@ -10,6 +11,7 @@ import tensorflow as tf
 from tensorflow.keras import __version__ as KERAS_VERSION
 from tensorflow.python.keras.callbacks import Callback as KerasCallback, CallbackList as KerasCallbackList
 from tensorflow.python.keras.utils.generic_utils import Progbar
+
 
 class Callback(KerasCallback):
     def _set_env(self, env):
@@ -102,6 +104,7 @@ class CallbackList(KerasCallbackList):
 
 class TestLogger(Callback):
     """ Logger Class for Test """
+
     def on_train_begin(self, logs):
         """ Print logs at beginning of training"""
         print('Testing for {} episodes ...'.format(self.params['nb_episodes']))
@@ -134,7 +137,7 @@ class TrainEpisodeLogger(Callback):
         self.train_start = timeit.default_timer()
         self.metrics_names = self.model.metrics_names
         print('Training for {} steps ...'.format(self.params['nb_steps']))
-        
+
     def on_train_end(self, logs):
         """ Print training time at end of training """
         duration = timeit.default_timer() - self.train_start
@@ -168,7 +171,7 @@ class TrainEpisodeLogger(Callback):
                 except Warning:
                     value = '--'
                     metrics_template += '{}: {}'
-                metrics_variables += [name, value]          
+                metrics_variables += [name, value]
         metrics_text = metrics_template.format(*metrics_variables)
 
         nb_step_digits = str(int(np.ceil(np.log10(self.params['nb_steps']))) + 1)
@@ -246,7 +249,7 @@ class TrainIntervalLogger(Callback):
                     assert means.shape == (len(self.metrics_names),)
                     for name, mean in zip(self.metrics_names, means):
                         formatted_metrics += ' - {}: {:.3f}'.format(name, mean)
-                
+
                 formatted_infos = ''
                 if len(self.infos) > 0:
                     infos = np.array(self.infos)
@@ -255,7 +258,12 @@ class TrainIntervalLogger(Callback):
                         assert means.shape == (len(self.info_names),)
                         for name, mean in zip(self.info_names, means):
                             formatted_infos += ' - {}: {:.3f}'.format(name, mean)
-                print('{} episodes - episode_reward: {:.3f} [{:.3f}, {:.3f}]{}{}'.format(len(self.episode_rewards), np.mean(self.episode_rewards), np.min(self.episode_rewards), np.max(self.episode_rewards), formatted_metrics, formatted_infos))
+                print('{} episodes - episode_reward: {:.3f} [{:.3f}, {:.3f}]{}{}'.format(len(self.episode_rewards),
+                                                                                         np.mean(self.episode_rewards),
+                                                                                         np.min(self.episode_rewards),
+                                                                                         np.max(self.episode_rewards),
+                                                                                         formatted_metrics,
+                                                                                         formatted_infos))
                 print('')
             self.reset()
             print('Interval {} ({} steps performed)'.format(self.step // self.interval + 1, self.step))
@@ -306,7 +314,7 @@ class FileLogger(Callback):
         self.starts[episode] = timeit.default_timer()
 
     def on_episode_end(self, episode, logs):
-        """ Compute and print metrics at the end of each episode """ 
+        """ Compute and print metrics at the end of each episode """
         duration = timeit.default_timer() - self.starts[episode]
 
         metrics = self.metrics[episode]
@@ -354,6 +362,105 @@ class FileLogger(Callback):
         # grow strictly monotonously.
         with open(self.filepath, 'w') as f:
             json.dump(sorted_data, f)
+
+
+class CsvLogger(Callback):
+    def __init__(self, filepath, delimiter=','):
+        # Some algorithms compute multiple episodes at once since they are multi-threaded.
+        # We therefore use a dictionary that is indexed by the episode to separate episodes
+        # from each other.
+        self.episode_start = {}
+        self.observations = {}
+        self.rewards = {}
+        self.actions = {}
+        self.metrics = {}
+        self.filepath = filepath
+        self.delimiter = delimiter
+        self.step = 0
+        self.log_fields = ['episode', 'episode_reward', 'episode_steps', 'steps', 'episode_duration', 'duration']
+
+    def on_train_begin(self, logs):
+        """ Print training values at beginning of training """
+        self.train_start = timeit.default_timer()
+        self.metrics_names = self.model.metrics_names
+        with open(self.filepath, 'w') as csv_file:
+            writer = csv.writer(csv_file, delimiter=self.delimiter)
+            writer.writerow(self.log_fields)
+
+    def on_episode_begin(self, episode, logs):
+        """ Reset environment variables at beginning of each episode """
+        self.episode_start[episode] = timeit.default_timer()
+        self.observations[episode] = []
+        self.rewards[episode] = []
+        self.actions[episode] = []
+        self.metrics[episode] = []
+
+    def on_episode_end(self, episode, logs):
+        """ Compute and print training statistics of the episode when done """
+        current = timeit.default_timer()
+        duration = current - self.episode_start[episode]
+        total_duration = current - self.train_start
+        episode_steps = len(self.observations[episode])
+
+        # Format all metrics.
+        metrics = np.array(self.metrics[episode])
+        metrics_template = ''
+        metrics_variables = []
+        with warnings.catch_warnings():
+            warnings.filterwarnings('error')
+            for idx, name in enumerate(self.metrics_names):
+                if idx > 0:
+                    metrics_template += ', '
+                try:
+                    value = np.nanmean(metrics[:, idx])
+                    metrics_template += '{}: {:f}'
+                except Warning:
+                    value = '--'
+                    metrics_template += '{}: {}'
+                metrics_variables += [name, value]
+        metrics_text = metrics_template.format(*metrics_variables)
+
+        nb_step_digits = str(int(np.ceil(np.log10(self.params['nb_steps']))) + 1)
+        template = '{step: ' + nb_step_digits + 'd}/{nb_steps}: episode: {episode}, duration: {duration:.3f}s, episode steps: {episode_steps:3}, steps per second: {sps:3.0f}, episode reward: {episode_reward:6.3f}, mean reward: {reward_mean:6.3f} [{reward_min:6.3f}, {reward_max:6.3f}], mean action: {action_mean:.3f} [{action_min:.3f}, {action_max:.3f}],  {metrics}'
+        variables = {
+            'step': self.step,
+            'nb_steps': self.params['nb_steps'],
+            'episode': episode + 1,
+            'duration': duration,
+            'episode_steps': episode_steps,
+            'sps': float(episode_steps) / duration,
+            'episode_reward': np.sum(self.rewards[episode]),
+            'reward_mean': np.mean(self.rewards[episode]),
+            'reward_min': np.min(self.rewards[episode]),
+            'reward_max': np.max(self.rewards[episode]),
+            'action_mean': np.mean(self.actions[episode]),
+            'action_min': np.min(self.actions[episode]),
+            'action_max': np.max(self.actions[episode]),
+            'metrics': metrics_text
+        }
+        log_dict = {'episode': episode + 1,
+                'episode_reward': np.sum(self.rewards[episode]),
+                'episode_steps': episode_steps, 'step': nb_step_digits,
+                'episode_duration': '{:.3f}'.format(duration), 'duration': '{:.3f}'.format(total_duration)}
+        with open(self.filepath, 'a') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=log_dict.keys())
+            writer.writerow(log_dict)
+
+        # Free up resources.
+        del self.episode_start[episode]
+        del self.observations[episode]
+        del self.rewards[episode]
+        del self.actions[episode]
+        del self.metrics[episode]
+
+    def on_step_end(self, step, logs):
+        """ Update statistics of episode after each step """
+        episode = logs['episode']
+        self.observations[episode].append(logs['observation'])
+        self.rewards[episode].append(logs['reward'])
+        self.actions[episode].append(logs['action'])
+        self.metrics[episode].append(logs['metrics'])
+        self.step += 1
 
 
 class Visualizer(Callback):
