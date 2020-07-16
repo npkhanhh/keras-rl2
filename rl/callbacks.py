@@ -440,7 +440,7 @@ class CsvLogger(Callback):
         }
         log_dict = {'episode': episode + 1,
                 'episode_reward': np.sum(self.rewards[episode]),
-                'episode_steps': episode_steps, 'step': nb_step_digits,
+                'episode_steps': episode_steps, 'step': self.step,
                 'episode_duration': '{:.3f}'.format(duration), 'duration': '{:.3f}'.format(total_duration)}
         with open(self.filepath, 'a') as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=log_dict.keys())
