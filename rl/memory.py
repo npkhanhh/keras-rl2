@@ -3,9 +3,8 @@ from collections import deque, namedtuple
 import warnings
 import random
 import copy
-
+from rl.common.sum_tree import SumTree
 import numpy as np
-
 
 # This is to be understood as a transition: Given `state0`, performing `action`
 # yields `reward` and results in `state1`, which might be `terminal`.
@@ -37,7 +36,8 @@ def sample_batch_indexes(low, high, size):
         # Not enough data. Help ourselves with sampling from the range, but the same index
         # can occur multiple times. This is not good and should be avoided by picking a
         # large enough warm-up phase.
-        warnings.warn('Not enough entries to sample without replacement. Consider increasing your warm-up phase to avoid oversampling!')
+        warnings.warn(
+            'Not enough entries to sample without replacement. Consider increasing your warm-up phase to avoid oversampling!')
         batch_idxs = np.random.random_integers(low, high - 1, size=size)
     assert len(batch_idxs) == size
     return batch_idxs
@@ -83,12 +83,13 @@ class RingBuffer(object):
         """
         return len(self.data)
 
+
 def zeroed_observation(observation):
     """Return an array of zeros with same shape as given observation
 
     # Argument
         observation (list): List of observation
-    
+
     # Return
         A np.ndarray of zeros with observation.shape
     """
@@ -110,7 +111,7 @@ def zeroed_observation(observation):
 
 
 class Memory(object):
-    def __init__(self, window_length, ignore_episode_boundaries=False):
+    def __init__(self, window_length=1, ignore_episode_boundaries=False):
         self.window_length = window_length
         self.ignore_episode_boundaries = ignore_episode_boundaries
 
@@ -152,7 +153,7 @@ class Memory(object):
 
     def get_config(self):
         """Return configuration (window_length, ignore_episode_boundaries) for Memory
-        
+
         # Return
             A dict with keys window_length and ignore_episode_boundaries
         """
@@ -162,10 +163,11 @@ class Memory(object):
         }
         return config
 
+
 class SequentialMemory(Memory):
     def __init__(self, limit, **kwargs):
         super(SequentialMemory, self).__init__(**kwargs)
-        
+
         self.limit = limit
 
         # Do not use deque to implement the memory. This data structure may seem convenient but
@@ -253,9 +255,9 @@ class SequentialMemory(Memory):
             action (int): Action taken to obtain this observation
             reward (float): Reward obtained by taking this action
             terminal (boolean): Is the state terminal
-        """ 
+        """
         super(SequentialMemory, self).append(observation, action, reward, terminal, training=training)
-        
+
         # This needs to be understood as follows: in `observation`, take `action`, obtain `reward`
         # and weather the next state is `terminal` or not.
         if training:
@@ -353,5 +355,71 @@ class EpisodeParameterMemory(Memory):
             Dict of config
         """
         config = super(SequentialMemory, self).get_config()
+        config['limit'] = self.limit
+        return config
+
+
+class ProportionalPrioritizedMemory(Memory):
+    def __init__(self, alpha, epsilon, limit, **kwargs):
+        super(ProportionalPrioritizedMemory, self).__init__(**kwargs)
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.limit = limit
+        self.tree = SumTree(limit)
+
+    def sample(self, batch_size, batch_idxs=None):
+        """Return a prioritized batch of experiences
+
+        # Argument
+            batch_size (int): Size of the batch
+        # Returns
+            A list of experiences randomly selected
+        """
+        experiences = []
+        indexes = []
+        probabilities = []
+        for _ in range(batch_size):
+            r = random.random()
+            content, value, idx = self.tree.find(r)
+            state0, action, reward, _ = content
+            if idx == self.limit - 1:
+                idx = 0
+            state1, _, _, terminal1 = self.tree.get_data(idx)
+            experiences.append(Experience(state0=[state0], action=action, reward=reward,
+                                          state1=[state1], terminal1=terminal1))
+            indexes.append(idx)
+
+            probabilities.append(value / self.tree.get_total_value() if value > 0 else 0)
+        assert len(experiences) == batch_size
+        return experiences, indexes, probabilities
+
+    def append(self, observation, action, reward, terminal, training=True):
+        super(ProportionalPrioritizedMemory, self).append(observation, action, reward, terminal, training=training)
+        priority = self.tree.get_max_value()
+        if training:
+            self.tree.add((observation, action, reward, terminal), priority)
+
+    def update_priority(self, indexes, td_error):
+        assert len(td_error) == len(indexes)
+        for i, error in enumerate(td_error):
+            index = indexes[i]
+            self.tree.val_update(index, abs(error) + self.epsilon)
+
+    @property
+    def nb_entries(self):
+        """Return number of observations
+
+        # Returns
+            Number of observations
+        """
+        return len(self.observations)
+
+    def get_config(self):
+        """Return configurations of SequentialMemory
+
+        # Returns
+            Dict of config
+        """
+        config = super(ProportionalPrioritizedMemory, self).get_config()
         config['limit'] = self.limit
         return config

@@ -17,6 +17,7 @@ def mean_q(y_true, y_pred):
 class AbstractDQNAgent(Agent):
     """Write me
     """
+
     def __init__(self, nb_actions, memory, gamma=.99, batch_size=32, nb_steps_warmup=1000,
                  train_interval=1, memory_interval=1, target_model_update=10000,
                  delta_range=None, delta_clip=np.inf, custom_model_objects={}, **kwargs):
@@ -33,7 +34,9 @@ class AbstractDQNAgent(Agent):
             target_model_update = float(target_model_update)
 
         if delta_range is not None:
-            warnings.warn('`delta_range` is deprecated. Please use `delta_clip` instead, which takes a single scalar. For now we\'re falling back to `delta_range[1] = {}`'.format(delta_range[1]))
+            warnings.warn(
+                '`delta_range` is deprecated. Please use `delta_clip` instead, which takes a single scalar. For now we\'re falling back to `delta_range[1] = {}`'.format(
+                    delta_range[1]))
             delta_clip = delta_range[1]
 
         # Parameters.
@@ -46,6 +49,7 @@ class AbstractDQNAgent(Agent):
         self.target_model_update = target_model_update
         self.delta_clip = delta_clip
         self.custom_model_objects = custom_model_objects
+        self.out_layer_name = ''
 
         # Related objects.
         self.memory = memory
@@ -83,6 +87,7 @@ class AbstractDQNAgent(Agent):
             'memory': get_object_config(self.memory),
         }
 
+
 # An implementation of the DQN agent as described in Mnih (2013) and Mnih (2015).
 # http://arxiv.org/pdf/1312.5602.pdf
 # http://arxiv.org/abs/1509.06461
@@ -99,18 +104,22 @@ class DQNAgent(AbstractDQNAgent):
             `max`: Q(s,a;theta) = V(s;theta) + (A(s,a;theta)-max_a(A(s,a;theta)))
             `naive`: Q(s,a;theta) = V(s;theta) + A(s,a;theta)
     """
+
     def __init__(self, model, policy=None, test_policy=None, enable_double_dqn=False, enable_dueling_network=False,
-                 dueling_type='avg', *args, **kwargs):
+                 dueling_type='avg', prioritized_strategy=None, *args, **kwargs):
         super(DQNAgent, self).__init__(*args, **kwargs)
 
         # Validate (important) input.
         if list(model.output.shape) != list((None, self.nb_actions)):
-            raise ValueError('Model output "{}" has invalid shape. DQN expects a model that has one dimension for each action, in this case {}.'.format(model.output, self.nb_actions))
+            raise ValueError(
+                'Model output "{}" has invalid shape. DQN expects a model that has one dimension for each action, in this case {}.'.format(
+                    model.output, self.nb_actions))
 
         # Parameters.
         self.enable_double_dqn = enable_double_dqn
         self.enable_dueling_network = enable_dueling_network
         self.dueling_type = dueling_type
+        self.prioritized_strategy = prioritized_strategy
         if self.enable_dueling_network:
             # get the second last layer of the model, abandon the last layer
             layer = model.layers[-2]
@@ -127,9 +136,13 @@ class DQNAgent(AbstractDQNAgent):
             # dueling_type == 'naive'
             # Q(s,a;theta) = V(s;theta) + A(s,a;theta)
             if self.dueling_type == 'avg':
-                outputlayer = Lambda(lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:] - K.mean(a[:, 1:], axis=1, keepdims=True), output_shape=(nb_action,))(y)
+                outputlayer = Lambda(
+                    lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:] - K.mean(a[:, 1:], axis=1, keepdims=True),
+                    output_shape=(nb_action,))(y)
             elif self.dueling_type == 'max':
-                outputlayer = Lambda(lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:] - K.max(a[:, 1:], axis=1, keepdims=True), output_shape=(nb_action,))(y)
+                outputlayer = Lambda(
+                    lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:] - K.max(a[:, 1:], axis=1, keepdims=True),
+                    output_shape=(nb_action,))(y)
             elif self.dueling_type == 'naive':
                 outputlayer = Lambda(lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:], output_shape=(nb_action,))(y)
             else:
@@ -186,6 +199,7 @@ class DQNAgent(AbstractDQNAgent):
         # using a custom Lambda layer that computes the loss. This gives us the necessary flexibility
         # to mask out certain parameters by passing in multiple inputs to the Lambda layer.
         y_pred = self.model.output
+        self.out_layer_name = y_pred.name.split('/')[0]
         y_true = Input(name='y_true', shape=(self.nb_actions,))
         mask = Input(name='mask', shape=(self.nb_actions,))
         loss_out = Lambda(clipped_masked_error, output_shape=(1,), name='loss')([y_true, y_pred, mask])
@@ -248,7 +262,13 @@ class DQNAgent(AbstractDQNAgent):
 
         # Train the network on a single stochastic batch.
         if self.step > self.nb_steps_warmup and self.step % self.train_interval == 0:
-            experiences = self.memory.sample(self.batch_size)
+            experiences = []
+            indexes = []
+            probabilities = []
+            if self.prioritized_strategy == 'per':
+                experiences, indexes, probabilities = self.memory.sample(self.batch_size)
+            else:
+                experiences = self.memory.sample(self.batch_size)
             assert len(experiences) == self.batch_size
 
             # Start by extracting the necessary parameters (we use a vectorized implementation).
@@ -315,12 +335,23 @@ class DQNAgent(AbstractDQNAgent):
             targets = np.array(targets).astype('float32')
             masks = np.array(masks).astype('float32')
 
+            sample_weight = {}
+            if self.prioritized_strategy == 'per':
+                old_q_values = np.max(self.compute_batch_q_values(state0_batch), axis=1).flatten()
+                td_errors = np.abs(Rs - old_q_values)
+                self.memory.update_priority(indexes, td_errors)
+                memory_limit = self.memory.get_config()['limit']
+                weights = (memory_limit * np.array(probabilities)) ** -np.float(-1)
+                weights /= max(weights)
+                sample_weight[self.out_layer_name] = weights
             # Finally, perform a single update on the entire batch. We use a dummy target since
             # the actual loss is computed in a Lambda layer that needs more complex input. However,
             # it is still useful to know the actual target to compute metrics properly.
             ins = [state0_batch] if type(self.model.input) is not list else state0_batch
-            metrics = self.trainable_model.train_on_batch(ins + [targets, masks], [dummy_targets, targets])
-            metrics = [metric for idx, metric in enumerate(metrics) if idx not in (1, 2)]  # throw away individual losses
+            metrics = self.trainable_model.train_on_batch(ins + [targets, masks], [dummy_targets, targets],
+                                                          sample_weight=sample_weight)
+            metrics = [metric for idx, metric in enumerate(metrics) if
+                       idx not in (1, 2)]  # throw away individual losses
             metrics += self.policy.metrics
             if self.processor is not None:
                 metrics += self.processor.metrics
@@ -369,6 +400,7 @@ class DQNAgent(AbstractDQNAgent):
 class NAFLayer(Layer):
     """Write me
     """
+
     def __init__(self, nb_actions, mode='full', **kwargs):
         if mode not in ('full', 'diag'):
             raise RuntimeError('Unknown mode "{}" in NAFLayer.'.format(self.mode))
@@ -532,7 +564,7 @@ class NAFLayer(Layer):
         for i, shape in enumerate(input_shape):
             if len(shape) != 2:
                 raise RuntimeError("Input {} has {} dimensions but should have 2".format(i, len(shape)))
-        assert self.mode in ('full','diag')
+        assert self.mode in ('full', 'diag')
         if self.mode == 'full':
             expected_elements = (self.nb_actions * self.nb_actions + self.nb_actions) // 2
         elif self.mode == 'diag':
@@ -554,6 +586,7 @@ class NAFLayer(Layer):
 class NAFAgent(AbstractDQNAgent):
     """Write me
     """
+
     def __init__(self, V_model, L_model, mu_model, random_process=None,
                  covariance_mode='full', *args, **kwargs):
         super(NAFAgent, self).__init__(*args, **kwargs)
@@ -604,13 +637,14 @@ class NAFAgent(AbstractDQNAgent):
             observation_shapes = [i.shape[1:] for i in self.V_model.input]
         else:
             observation_shapes = [self.V_model.input.shape[1:]]
-        os_in = [Input(shape=shape, name='observation_input_{}'.format(idx)) for idx, shape in enumerate(observation_shapes)]
+        os_in = [Input(shape=shape, name='observation_input_{}'.format(idx)) for idx, shape in
+                 enumerate(observation_shapes)]
         L_out = self.L_model([a_in] + os_in)
         V_out = self.V_model(os_in)
 
         mu_out = self.mu_model(os_in)
         A_out = NAFLayer(self.nb_actions, mode=self.covariance_mode)([L_out, mu_out, a_in])
-        combined_out = Lambda(lambda x: x[0]+x[1], output_shape=lambda x: x[0])([A_out, V_out])
+        combined_out = Lambda(lambda x: x[0] + x[1], output_shape=lambda x: x[0])([A_out, V_out])
         combined = Model(inputs=[a_in] + os_in, outputs=[combined_out])
         # Compile combined model.
         if self.target_model_update < 1.:
